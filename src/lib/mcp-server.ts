@@ -146,6 +146,21 @@ function wrap<T>(
     }));
 }
 
+/**
+ * Collapse deployment-read failures to a fixed message. Coolify error bodies
+ * are free-form and may themselves contain credentials, so they must not be
+ * copied into the model-facing MCP response.
+ */
+async function deploymentRead<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    throw new Error('Coolify deployment read failed without returning the upstream error body', {
+      cause: error,
+    });
+  }
+}
+
 const TRUNCATION_PREFIX = '...[truncated]...\n';
 
 /**
@@ -2051,14 +2066,14 @@ export class CoolifyMcpServer extends McpServer {
 
     this.defineTool(
       'deployment',
-      'Manage deployment: get/cancel/list_for_app. Logs excluded by default on all actions — for get use `lines` (paginated tail), for list_for_app use `include_logs: true` to include raw build-log blobs.',
+      'Manage deployment: get/cancel/list_for_app. Free-form build-log text is never returned because it can contain credentials. For get, `lines` returns bounded availability/count metadata; for list_for_app, `include_logs: true` returns the same omission metadata per deployment.',
       {
         action: z.enum(['get', 'cancel', 'list_for_app']),
         uuid: z.string(),
-        lines: z.number().optional(), // Include logs truncated to last N entries (omit for no logs)
-        page: z.number().optional(), // Log page (1=most recent, 2=older, etc.)
-        max_chars: z.number().optional(), // Limit log output to last N chars (default: 50000)
-        include_logs: z.boolean().optional(), // list_for_app only: include raw build logs (default false; upstream returns ~30KB per deployment)
+        lines: z.number().optional(), // Request log availability/count metadata (free-form text is omitted)
+        page: z.number().optional(), // Requested log page recorded in omission metadata
+        max_chars: z.number().optional(), // Bounded parsing budget; no log text is returned
+        include_logs: z.boolean().optional(), // list_for_app only: request per-row log count/omission metadata
       },
       async ({ action, uuid, lines, page, max_chars, include_logs }) => {
         switch (action) {
@@ -2068,34 +2083,39 @@ export class CoolifyMcpServer extends McpServer {
               const p = page ?? 1;
               const ll = lines;
               return wrapWithActions(
-                async () => {
-                  const deployment = await this.client.getDeployment(uuid, {
-                    includeLogs: true,
-                  });
-                  if (deployment.logs) {
-                    // Leave room for the untrusted-data boundary so the wrapped
-                    // result honours the caller's max_chars budget — except at
-                    // the 500-char floor, where a too-small budget would truncate
-                    // the logs to uselessness. Below ~(500 + boundary) chars the
-                    // boundary wins over the cap on purpose; usable logs matter
-                    // more than an exact byte count that small.
-                    const budget = Math.max(
-                      500,
-                      (max_chars ?? 50000) - UNTRUSTED_LOG_BOUNDARY_CHARS,
-                    );
-                    const result = truncateLogs(deployment.logs, ll, budget, p);
-                    // Attacker-influenceable build output — frame as untrusted (FINDINGS #4).
-                    deployment.logs = asUntrustedLogs(result.logs);
+                () =>
+                  deploymentRead(async () => {
+                    const deployment = await this.client.getDeployment(uuid, {
+                      includeLogs: true,
+                    });
+                    if (typeof deployment.logs === 'string') {
+                      // Free-form historical logs cannot be reliably redacted:
+                      // credentials may be unknown, transformed, split or encoded.
+                      // Parse only enough to report bounded count metadata, then
+                      // discard the text at the model-facing MCP boundary.
+                      const result = truncateLogs(deployment.logs, ll, max_chars ?? 50000, p);
+                      const essential = { ...deployment };
+                      delete essential.logs;
+                      return {
+                        ...essential,
+                        logs: null,
+                        logs_redacted: true,
+                        logs_omitted_reason: 'untrusted_free_form',
+                        logs_meta: {
+                          total_entries: result.total,
+                          requested_lines: ll,
+                          requested_page: p,
+                        },
+                      };
+                    }
                     return {
                       ...deployment,
-                      logs_meta: {
-                        total_entries: result.total,
-                        showing: `${result.showing_start}-${result.showing_end} of ${result.total}`,
-                      },
+                      logs: null,
+                      logs_redacted: true,
+                      logs_omitted_reason: 'untrusted_free_form',
+                      logs_meta: { total_entries: 0, requested_lines: ll, requested_page: p },
                     };
-                  }
-                  return { ...deployment, logs_meta: undefined };
-                },
+                  }),
                 (dep) => getDeploymentActions(dep.uuid, dep.status, dep.application_uuid),
                 (dep) => {
                   const total = dep.logs_meta?.total_entries ?? 0;
@@ -2117,26 +2137,39 @@ export class CoolifyMcpServer extends McpServer {
             }
             // Otherwise return essential info without logs
             return wrapWithActions(
-              () => this.client.getDeployment(uuid),
+              () => deploymentRead(() => this.client.getDeployment(uuid)),
               (dep) => getDeploymentActions(dep.uuid, dep.status, dep.application_uuid),
             );
           case 'cancel':
             return wrap(() => this.client.cancelDeployment(uuid));
           case 'list_for_app':
-            return wrap(async () => {
-              const result = await this.client.listApplicationDeployments(uuid, {
-                includeLogs: include_logs,
-              });
-              // include_logs pulls raw build output onto each row — same
-              // attacker-influenceable surface as the other log paths (FINDINGS #4).
-              if (!include_logs) return result;
-              return {
-                ...result,
-                deployments: result.deployments.map((d) =>
-                  typeof d.logs === 'string' ? { ...d, logs: asUntrustedLogs(d.logs) } : d,
-                ),
-              };
-            });
+            return wrap(() =>
+              deploymentRead(async () => {
+                const result = await this.client.listApplicationDeployments(uuid, {
+                  includeLogs: include_logs,
+                });
+                // include_logs may pull raw build output onto every row. Never
+                // forward that free-form text to the model-facing MCP result.
+                if (!include_logs) return result;
+                return {
+                  ...result,
+                  deployments: result.deployments.map((deployment) => {
+                    const { logs: rawLogs, ...essential } = deployment;
+                    const count =
+                      typeof rawLogs === 'string'
+                        ? truncateLogs(rawLogs, Number.MAX_SAFE_INTEGER, 50000, 1).total
+                        : 0;
+                    return {
+                      ...essential,
+                      logs: null,
+                      logs_redacted: true,
+                      logs_omitted_reason: 'untrusted_free_form',
+                      logs_meta: { total_entries: count },
+                    };
+                  }),
+                };
+              }),
+            );
         }
       },
     );
