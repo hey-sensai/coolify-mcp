@@ -14,6 +14,7 @@ describe('distribution manifests', () => {
     version: string;
     mcpName: string;
     description: string;
+    files: string[];
   };
 
   it('server.json (MCP registry) matches package.json', () => {
@@ -33,5 +34,10 @@ describe('distribution manifests', () => {
     const manifest = read('manifest.json') as unknown as { version: string; server: unknown };
     expect(manifest.version).toBe(pkg.version);
     expect(manifest.server).toBeDefined();
+  });
+
+  it('ships the reviewed dependency graph as npm shrinkwrap metadata', () => {
+    expect(pkg.files).toContain('npm-shrinkwrap.json');
+    expect(read('npm-shrinkwrap.json')).toEqual(read('package-lock.json'));
   });
 });
